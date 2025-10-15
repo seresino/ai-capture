@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI Capture MVP</title>
+  </head>
+  <body>
+    <h1>AI Capture</h1>
+    <button id="record-button">Record</button>
+    <hr />
+    <h3>Transcript:</h3>
+    <div
+      id="transcript"
+      style="border: 1px solid #ccc; padding: 10px; min-height: 100px"
+    ></div>
+    <!-- Load AssemblyAI full SDK via CDN so `assemblyai.StreamingTranscriber` is available -->
+    <script defer src="https://www.unpkg.com/assemblyai@latest/dist/assemblyai.umd.min.js"></script>
+    <script defer src="/main.js"></script>
+  </body>
+</html>
