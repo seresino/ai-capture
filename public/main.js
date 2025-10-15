@@ -20,6 +20,132 @@ let selectedDeviceId = localStorage.getItem("selectedDeviceId") || "";
 // FR-2: simple state for take segmentation
 let takeActive = false;
 
+// FR-3: pending scene/take state
+let pendingScene = null;
+let pendingTake = null;
+let pendingTs = 0;
+
+const natoMap = {
+  alpha: "A", bravo: "B", charlie: "C", delta: "D", echo: "E", foxtrot: "F",
+  golf: "G", hotel: "H", india: "I", juliet: "J", juliett: "J", kilo: "K",
+  lima: "L", mike: "M", november: "N", oscar: "O", papa: "P", quebec: "Q",
+  romeo: "R", sierra: "S", tango: "T", uniform: "U", victor: "V", whiskey: "W",
+  xray: "X", "x-ray": "X", yankee: "Y", zulu: "Z"
+};
+
+// Basic number word parsing for English (0..9999 typical for scenes/takes)
+const smallNumbers = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+  seventeen: 17, eighteen: 18, nineteen: 19
+};
+const tensNumbers = {
+  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90
+};
+const scaleNumbers = { hundred: 100, thousand: 1000 };
+
+function wordsToNumber(str) {
+  if (!str) return null;
+  const tokens = str
+    .toLowerCase()
+    .replace(/-/g, " ")
+    .trim()
+    .split(/\s+/);
+  let total = 0;
+  let current = 0;
+  let consumed = 0;
+  let usedAny = false;
+  for (const tok of tokens) {
+    if (/^\d+$/.test(tok)) {
+      // Digit token short-circuits and stops number word parsing
+      total += current;
+      total += parseInt(tok, 10);
+      consumed++;
+      usedAny = true;
+      break;
+    } else if (tok in smallNumbers) {
+      current += smallNumbers[tok];
+      consumed++;
+      usedAny = true;
+    } else if (tok in tensNumbers) {
+      current += tensNumbers[tok];
+      consumed++;
+      usedAny = true;
+    } else if (tok in scaleNumbers) {
+      // e.g., one hundred -> multiply current by 100
+      current = (current || 1) * scaleNumbers[tok];
+      consumed++;
+      usedAny = true;
+    } else if (tok === 'and') {
+      consumed++;
+      continue;
+    } else {
+      break;
+    }
+  }
+  if (!usedAny) return null;
+  total += current;
+  return { value: total, consumed };
+}
+
+function parseSceneTake(text) {
+  if (!text) return;
+  const t = text.toLowerCase();
+  const now = Date.now();
+  // Try to capture a scene block up to the next keyword to avoid over-capture
+  const sceneBlock = t.match(/\bscene\s+([a-z0-9\s-]+?)(?=\b(take|action|rolling|turnover|cut)\b|$)/);
+  if (sceneBlock) {
+    const block = sceneBlock[1].trim();
+    const parts = block.split(/\s+/);
+    // Parse leading number (digits or words)
+    const numParse = wordsToNumber(parts.join(' '));
+    let sceneNum = null;
+    let consumed = 0;
+    if (numParse) {
+      sceneNum = numParse.value;
+      consumed = numParse.consumed;
+    } else if (/^\d+$/.test(parts[0])) {
+      sceneNum = parseInt(parts[0], 10);
+      consumed = 1;
+    }
+    if (sceneNum !== null) {
+      const suffixParts = parts.slice(consumed);
+      let letters = "";
+      for (const p of suffixParts) {
+        if (!p) continue;
+        const w = p.replace(/[^a-z]/g, "");
+        if (!w) continue;
+        if (natoMap[w]) {
+          letters += natoMap[w];
+        } else {
+          letters += w[0].toUpperCase();
+        }
+      }
+      pendingScene = letters ? `${sceneNum}${letters}` : `${sceneNum}`;
+      pendingTs = now;
+    }
+  }
+
+  // TAKE: support digits or number words
+  let takeMatched = false;
+  const takeDigits = t.match(/\btake\s+(\d+)\b/);
+  if (takeDigits) {
+    pendingTake = takeDigits[1];
+    pendingTs = now;
+    takeMatched = true;
+  }
+  if (!takeMatched) {
+    const takeBlock = t.match(/\btake\s+([a-z0-9\s-]+?)(?=\b(action|rolling|turnover|cut)\b|$)/);
+    if (takeBlock) {
+      const parsed = wordsToNumber(takeBlock[1]);
+      if (parsed && typeof parsed.value === 'number') {
+        pendingTake = String(parsed.value);
+        pendingTs = now;
+      }
+    }
+  }
+}
+
 function flashStatus(msg, color = "#ef4444", durationMs = 2000) {
   if (!statusEl) return;
   const prevColor = statusEl.style.color;
@@ -57,6 +183,16 @@ function handleStructuralKeywords(text) {
     if (evt.type === "action") {
       if (!takeActive) {
         takeActive = true;
+        // If we have a recent pending scene/take, show header
+        const now = Date.now();
+        if (pendingTs && now - pendingTs < 10000 /* 10s window */) {
+          const sceneText = pendingScene ? `SCENE ${pendingScene}` : null;
+          const takeText = pendingTake ? `TAKE ${pendingTake}` : null;
+          const header = [sceneText, takeText].filter(Boolean).join(" / ");
+          if (header) {
+            transcriptDiv.innerHTML += `<p><strong>${header}</strong></p>`;
+          }
+        }
         transcriptDiv.innerHTML += `<p>--- ACTION ---</p>`;
         flashStatus("ACTION detected", "#16a34a");
       }
@@ -65,6 +201,10 @@ function handleStructuralKeywords(text) {
         takeActive = false;
         transcriptDiv.innerHTML += `<p>--- CUT ---</p>`;
         flashStatus("CUT detected", "#2563eb");
+        // Reset pending scene/take after a take completes
+        pendingScene = null;
+        pendingTake = null;
+        pendingTs = 0;
       }
     }
   }
@@ -254,7 +394,8 @@ async function run() {
     transcriber.on("turn", (turn) => {
       // Display final transcripts at end of turn
       if (turn && turn.transcript) {
-        // Detect structural keywords in this chunk
+        // Update scene/take state and detect structural keywords
+        try { parseSceneTake(turn.transcript); } catch {}
         try { handleStructuralKeywords(turn.transcript); } catch {}
       }
       if (turn && turn.transcript && turn.end_of_turn) {
