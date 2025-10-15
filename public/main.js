@@ -17,6 +17,59 @@ let processorNode;
 
 let selectedDeviceId = localStorage.getItem("selectedDeviceId") || "";
 
+// FR-2: simple state for take segmentation
+let takeActive = false;
+
+function flashStatus(msg, color = "#ef4444", durationMs = 2000) {
+  if (!statusEl) return;
+  const prevColor = statusEl.style.color;
+  const prevText = statusEl.textContent;
+  statusEl.style.color = color;
+  statusEl.textContent = msg;
+  setTimeout(() => {
+    // Restore only if not overwritten by recording status
+    if (isRecording) {
+      statusEl.style.color = prevColor || "";
+      statusEl.textContent = "Recording";
+    } else {
+      statusEl.style.color = prevColor || "";
+      statusEl.textContent = "";
+    }
+  }, durationMs);
+}
+
+function handleStructuralKeywords(text) {
+  if (!text) return;
+  const t = text.toLowerCase();
+  const hasAction = /\b(action|rolling|turnover)\b/.test(t);
+  const hasCut = /\bcut\b/.test(t);
+
+  // If both appear, respect ordering within the string
+  const firstActionIdx = t.search(/\b(action|rolling|turnover)\b/);
+  const firstCutIdx = t.search(/\bcut\b/);
+
+  const ordered = [];
+  if (hasAction) ordered.push({ type: "action", idx: firstActionIdx });
+  if (hasCut) ordered.push({ type: "cut", idx: firstCutIdx });
+  ordered.sort((a, b) => a.idx - b.idx);
+
+  for (const evt of ordered) {
+    if (evt.type === "action") {
+      if (!takeActive) {
+        takeActive = true;
+        transcriptDiv.innerHTML += `<p>--- ACTION ---</p>`;
+        flashStatus("ACTION detected", "#16a34a");
+      }
+    } else if (evt.type === "cut") {
+      if (takeActive) {
+        takeActive = false;
+        transcriptDiv.innerHTML += `<p>--- CUT ---</p>`;
+        flashStatus("CUT detected", "#2563eb");
+      }
+    }
+  }
+}
+
 async function listAudioInputs() {
   try {
     // Request permission so labels are available
@@ -200,6 +253,10 @@ async function run() {
 
     transcriber.on("turn", (turn) => {
       // Display final transcripts at end of turn
+      if (turn && turn.transcript) {
+        // Detect structural keywords in this chunk
+        try { handleStructuralKeywords(turn.transcript); } catch {}
+      }
       if (turn && turn.transcript && turn.end_of_turn) {
         transcriptDiv.innerHTML += `<p>${turn.transcript}</p>`;
       }
