@@ -35,9 +35,17 @@ async function run() {
       }
       if (processorNode) {
         try {
+          // Notify worklet to stop if applicable
+          if (processorNode.port && typeof processorNode.port.postMessage === "function") {
+            processorNode.port.postMessage({ type: "disconnect" });
+          }
+        } catch {}
+        try {
           processorNode.disconnect();
         } catch {}
-        processorNode.onaudioprocess = null;
+        try {
+          processorNode.onaudioprocess = null;
+        } catch {}
         processorNode = null;
       }
       if (sourceNode) {
@@ -131,6 +139,8 @@ async function run() {
       console.log("Session closed.", { code, reason });
       isRecording = false;
       recordBtn.innerText = "Record";
+      // Prevent further sends if the socket is closed
+      transcriber = null;
     });
 
     transcriber.on("turn", (turn) => {
@@ -167,20 +177,12 @@ async function run() {
       return;
     }
 
-    // 5) Stream raw PCM using AudioContext + ScriptProcessorNode
+    // 5) Stream raw PCM using AudioWorkletNode with fallback to ScriptProcessorNode
     try {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({});
       }
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-      // Buffer size: 4096 gives reasonable latency
-      const bufferSize = 4096;
-      const channels = 1;
-      processorNode = audioCtx.createScriptProcessor(
-        bufferSize,
-        channels,
-        channels
-      );
 
       const floatTo16BitPCM = (input) => {
         const output = new Int16Array(input.length);
@@ -191,16 +193,73 @@ async function run() {
         return output;
       };
 
-      processorNode.onaudioprocess = (e) => {
-        if (!transcriber) return;
-        const inputBuffer = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
-        const pcm16 = floatTo16BitPCM(inputBuffer);
-        transcriber.sendAudio(pcm16.buffer);
-      };
+      // Accumulation buffers to meet service min input duration (>=50ms)
+      let chunkBuffer = [];
+      let chunkLength = 0;
+      const sr = audioCtx.sampleRate || detectedSampleRate || 48000;
+      const minSamples = Math.round(sr * 0.05); // 50ms
+      const maxSamples = Math.round(sr * 0.2);  // 200ms cap
 
-      sourceNode.connect(processorNode);
-      processorNode.connect(audioCtx.destination); // required by some browsers
-      console.log("PCM streaming started via ScriptProcessorNode");
+      try {
+        await audioCtx.audioWorklet.addModule("/audio-processor.js");
+        const workletNode = new AudioWorkletNode(audioCtx, "audio-processor");
+        workletNode.port.onmessage = (event) => {
+          if (!transcriber) return;
+          const float32 = event.data; // Float32Array [-1,1] ~128 samples/frame
+          if (!float32 || !float32.length) return;
+          chunkBuffer.push(float32);
+          chunkLength += float32.length;
+
+          if (chunkLength >= minSamples) {
+            // Build a contiguous chunk up to maxSamples
+            const take = Math.min(chunkLength, maxSamples);
+            const merged = new Float32Array(take);
+            let offset = 0;
+            while (offset < take && chunkBuffer.length) {
+              const cur = chunkBuffer[0];
+              const copyCount = Math.min(cur.length, take - offset);
+              merged.set(cur.subarray(0, copyCount), offset);
+              offset += copyCount;
+              if (copyCount === cur.length) {
+                chunkBuffer.shift();
+              } else {
+                // Keep the remainder of the current buffer
+                chunkBuffer[0] = cur.subarray(copyCount);
+              }
+            }
+            chunkLength -= take;
+
+            try {
+              const pcm16 = floatTo16BitPCM(merged);
+              transcriber.sendAudio(pcm16.buffer);
+            } catch (sendErr) {
+              // If the socket closed, avoid further sends
+              console.warn("sendAudio failed:", sendErr);
+            }
+          }
+        };
+        sourceNode.connect(workletNode);
+        // Do not connect to destination to avoid echo
+        processorNode = workletNode;
+        console.log("PCM streaming started via AudioWorkletNode");
+      } catch (workletErr) {
+        console.warn("AudioWorkletNode failed, falling back to ScriptProcessorNode:", workletErr);
+        // Fallback: ScriptProcessorNode
+        const bufferSize = 4096;
+        const channels = 1;
+        const scriptNode = audioCtx.createScriptProcessor(bufferSize, channels, channels);
+        scriptNode.onaudioprocess = (e) => {
+          if (!transcriber) return;
+          const inputBuffer = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
+          const pcm16 = floatTo16BitPCM(inputBuffer);
+          transcriber.sendAudio(pcm16.buffer);
+        };
+        sourceNode.connect(scriptNode);
+        // Some browsers require connection to destination
+        try { scriptNode.connect(audioCtx.destination); } catch {}
+        processorNode = scriptNode;
+        console.log("PCM streaming started via ScriptProcessorNode");
+      }
     } catch (e) {
       console.error("Failed to start PCM streaming:", e);
       // Cleanup
