@@ -7,7 +7,33 @@
   </head>
   <body>
     <h1>AI Capture</h1>
-    <button id="record-button">Record</button>
+
+    <div style="margin: 8px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+      <label>
+        Source:
+        <select id="source-type">
+          <option value="mic">Microphone / Line-in</option>
+          <option value="file">Audio File (coming soon)</option>
+        </select>
+      </label>
+
+      <label id="device-select-wrap">
+        Input Device:
+        <select id="audio-input">
+          <option value="">Default microphone</option>
+        </select>
+      </label>
+
+      <label id="file-input-wrap" style="display:none;">
+        Audio File:
+        <input id="audio-file" type="file" accept="audio/*" />
+      </label>
+    </div>
+
+    <button id="record-button" style="font-size: 18px; padding: 10px 18px; border-radius: 6px; border: 1px solid #b91c1c; background:#ef4444; color:white;">
+      Record
+    </button>
+    <span id="status-indicator" style="margin-left: 10px; font-weight: 600;"></span>
     <hr />
     <h3>Transcript:</h3>
     <div

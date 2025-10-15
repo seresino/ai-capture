@@ -2,6 +2,11 @@
 
 const recordBtn = document.getElementById("record-button");
 const transcriptDiv = document.getElementById("transcript");
+const sourceTypeSel = document.getElementById("source-type");
+const deviceSelect = document.getElementById("audio-input");
+const deviceSelectWrap = document.getElementById("device-select-wrap");
+const fileInputWrap = document.getElementById("file-input-wrap");
+const statusEl = document.getElementById("status-indicator");
 
 let isRecording = false;
 let transcriber;
@@ -9,6 +14,42 @@ let mediaStream;
 let audioCtx;
 let sourceNode;
 let processorNode;
+
+let selectedDeviceId = localStorage.getItem("selectedDeviceId") || "";
+
+async function listAudioInputs() {
+  try {
+    // Request permission so labels are available
+    const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tmp.getTracks().forEach((t) => t.stop());
+  } catch {}
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === "audioinput");
+    if (deviceSelect) {
+      deviceSelect.innerHTML = "";
+      const optDefault = document.createElement("option");
+      optDefault.value = "";
+      optDefault.textContent = "Default microphone";
+      deviceSelect.appendChild(optDefault);
+      for (const d of inputs) {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Input ${deviceSelect.options.length}`;
+        deviceSelect.appendChild(opt);
+      }
+      if (selectedDeviceId) {
+        deviceSelect.value = selectedDeviceId;
+      }
+      deviceSelect.onchange = () => {
+        selectedDeviceId = deviceSelect.value;
+        try { localStorage.setItem("selectedDeviceId", selectedDeviceId); } catch {}
+      };
+    }
+  } catch (e) {
+    console.warn("enumerateDevices failed:", e);
+  }
+}
 
 // Function to get the temporary token from our server
 async function getToken() {
@@ -69,11 +110,13 @@ async function run() {
     } finally {
       recordBtn.innerText = "Record";
       isRecording = false;
+      if (statusEl) statusEl.textContent = "";
     }
   } else {
     // Start recording
     transcriptDiv.innerHTML = "";
     recordBtn.innerText = "Connecting...";
+    if (statusEl) statusEl.textContent = "";
 
     // 1) Fetch token and validate response
     const token = await getToken();
@@ -84,11 +127,21 @@ async function run() {
     }
     console.log("Got temp token (truncated):", token.slice(0, 8) + "...");
 
-    // 2) Ask for microphone first and detect sample rate
+    // 2) Choose source: mic or file (file stub for future)
+    const srcType = (sourceTypeSel && sourceTypeSel.value) || "mic";
+    if (srcType === "file") {
+      alert("Audio file input coming soon. Please select Microphone / Line-in for now.");
+      recordBtn.innerText = "Record";
+      return;
+    }
+    // Mic/line-in path: getUserMedia with optional deviceId constraint
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const constraints = selectedDeviceId
+        ? { audio: { deviceId: { exact: selectedDeviceId } } }
+        : { audio: true };
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (err) {
-      console.error("Mic permission error:", err);
+      console.error("Mic permission/error:", err);
       recordBtn.innerText = "Record";
       return;
     }
@@ -127,6 +180,7 @@ async function run() {
       console.log("Session started.", info);
       recordBtn.innerText = "Stop Recording";
       isRecording = true;
+      if (statusEl) statusEl.textContent = "Recording";
     });
 
     transcriber.on("error", (error) => {
@@ -141,6 +195,7 @@ async function run() {
       recordBtn.innerText = "Record";
       // Prevent further sends if the socket is closed
       transcriber = null;
+      if (statusEl) statusEl.textContent = "";
     });
 
     transcriber.on("turn", (turn) => {
@@ -291,3 +346,23 @@ async function run() {
 }
 
 recordBtn.addEventListener("click", run);
+
+// Initialize UI
+if (sourceTypeSel) {
+  try {
+    const savedSrc = localStorage.getItem("sourceType") || "mic";
+    sourceTypeSel.value = savedSrc;
+  } catch {}
+  sourceTypeSel.onchange = () => {
+    const val = sourceTypeSel.value;
+    try { localStorage.setItem("sourceType", val); } catch {}
+    // Toggle visibility for device vs file inputs
+    if (deviceSelectWrap) deviceSelectWrap.style.display = val === "mic" ? "inline-block" : "none";
+    if (fileInputWrap) fileInputWrap.style.display = val === "file" ? "inline-block" : "none";
+  };
+  // Initial toggle state
+  sourceTypeSel.onchange();
+}
+
+// Populate audio device list (best-effort)
+listAudioInputs();
