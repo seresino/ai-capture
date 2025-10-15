@@ -142,8 +142,12 @@ async function run() {
 
     // 4) Connect after handlers are ready
     try {
-      // Log the actual connection URL for debugging
-      console.log("Connecting to:", transcriber.connectionUrl().toString());
+      // Log the connection URL with token redacted
+      {
+        const url = transcriber.connectionUrl().toString();
+        const masked = url.replace(/token=[^&]+/, "token=****");
+        console.log("Connecting to:", masked);
+      }
       await transcriber.connect();
       console.log("WebSocket connect() resolved");
     } catch (e) {
