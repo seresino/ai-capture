@@ -16,6 +16,8 @@ let sourceNode;
 let processorNode;
 
 let selectedDeviceId = localStorage.getItem("selectedDeviceId") || "";
+let dgSocket = null;
+const useDeepgram = true;
 
 // FR-2: simple state for take segmentation
 let takeActive = false;
@@ -24,6 +26,31 @@ let takeActive = false;
 let pendingScene = null;
 let pendingTake = null;
 let pendingTs = 0;
+
+// FR-4: speaker labeling state
+const speakerMap = new Map(); // rawSpeakerId -> display name
+let speakerCount = 0;
+
+function resolveSpeakerDisplay(raw) {
+  if (!raw) return null;
+  if (!speakerMap.has(raw)) {
+    speakerCount += 1;
+    speakerMap.set(raw, `Speaker ${speakerCount}`);
+  }
+  return speakerMap.get(raw);
+}
+
+function renameSpeaker(raw, newName) {
+  if (!raw) return;
+  const name = (newName || "").trim();
+  if (!name) return;
+  speakerMap.set(raw, name);
+  // Update existing DOM labels
+  const nodes = transcriptDiv.querySelectorAll(`[data-speaker-id="${CSS.escape(raw)}"]`);
+  nodes.forEach((el) => {
+    el.textContent = name;
+  });
+}
 
 const natoMap = {
   alpha: "A", bravo: "B", charlie: "C", delta: "D", echo: "E", foxtrot: "F",
@@ -311,14 +338,17 @@ async function run() {
     recordBtn.innerText = "Connecting...";
     if (statusEl) statusEl.textContent = "";
 
-    // 1) Fetch token and validate response
-    const token = await getToken();
-    if (!token) {
-      console.error("No token received from /token");
-      recordBtn.innerText = "Record";
-      return;
+    // 1) Provider initialization
+    let token = null;
+    if (!useDeepgram) {
+      token = await getToken();
+      if (!token) {
+        console.error("No token received from /token");
+        recordBtn.innerText = "Record";
+        return;
+      }
+      console.log("Got temp token (truncated):", token.slice(0, 8) + "...");
     }
-    console.log("Got temp token (truncated):", token.slice(0, 8) + "...");
 
     // 2) Choose source: mic or file (file stub for future)
     const srcType = (sourceTypeSel && sourceTypeSel.value) || "mic";
@@ -351,83 +381,159 @@ async function run() {
     }
     console.log("Detected sampleRate:", detectedSampleRate);
 
-    // 3) Create StreamingTranscriber using detected sample rate
-    try {
-      transcriber = new assemblyai.StreamingTranscriber({
-        token,
-        sampleRate: detectedSampleRate,
-        speakerLabels: true,
-      });
-    } catch (e) {
-      console.error("Failed to instantiate StreamingTranscriber:", e);
-      recordBtn.innerText = "Record";
-      // Stop mic since we failed to create transcriber
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((t) => t.stop());
-        mediaStream = null;
+    // 3) Create provider connection
+    if (!useDeepgram) {
+      try {
+        transcriber = new assemblyai.StreamingTranscriber({
+          token,
+          sampleRate: detectedSampleRate,
+          speakerLabels: true,
+        });
+      } catch (e) {
+        console.error("Failed to instantiate StreamingTranscriber:", e);
+        recordBtn.innerText = "Record";
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+          mediaStream = null;
+        }
+        return;
       }
-      return;
     }
 
-    transcriber.on("open", (info) => {
-      console.log("Session started.", info);
-      recordBtn.innerText = "Stop Recording";
-      isRecording = true;
-      if (statusEl) statusEl.textContent = "Recording";
-    });
+    if (!useDeepgram) {
+      transcriber.on("open", (info) => {
+        console.log("Session started.", info);
+        recordBtn.innerText = "Stop Recording";
+        isRecording = true;
+        if (statusEl) statusEl.textContent = "Recording";
+      });
+    }
 
-    transcriber.on("error", (error) => {
-      console.error("StreamingTranscriber error:", error);
-      isRecording = false;
-      recordBtn.innerText = "Record";
-    });
+    if (!useDeepgram) {
+      transcriber.on("error", (error) => {
+        console.error("StreamingTranscriber error:", error);
+        isRecording = false;
+        recordBtn.innerText = "Record";
+      });
+    }
 
-    transcriber.on("close", (code, reason) => {
-      console.log("Session closed.", { code, reason });
-      isRecording = false;
-      recordBtn.innerText = "Record";
-      // Prevent further sends if the socket is closed
-      transcriber = null;
-      if (statusEl) statusEl.textContent = "";
-    });
+    if (!useDeepgram) {
+      transcriber.on("close", (code, reason) => {
+        console.log("Session closed.", { code, reason });
+        isRecording = false;
+        recordBtn.innerText = "Record";
+        transcriber = null;
+        if (statusEl) statusEl.textContent = "";
+      });
+    }
 
-    transcriber.on("turn", (turn) => {
-      // Display final transcripts at end of turn
-      if (turn && turn.transcript) {
-        // Update scene/take state and detect structural keywords
-        try { parseSceneTake(turn.transcript); } catch {}
-        try { handleStructuralKeywords(turn.transcript); } catch {}
-      }
-      if (turn && turn.transcript && turn.end_of_turn) {
-        transcriptDiv.innerHTML += `<p>${turn.transcript}</p>`;
-      }
-    });
+    if (!useDeepgram) {
+      transcriber.on("turn", (turn) => {
+        if (turn && turn.transcript) {
+          try { parseSceneTake(turn.transcript); } catch {}
+          try { handleStructuralKeywords(turn.transcript); } catch {}
+        }
+        if (turn && turn.transcript && turn.end_of_turn) {
+          const rawSpeaker = (turn.speaker ?? turn.speaker_id ?? turn.speaker_label ?? null);
+          if (rawSpeaker) {
+            const display = resolveSpeakerDisplay(String(rawSpeaker));
+            const escapedRaw = String(rawSpeaker).replace(/["\\]/g, "\\$&");
+            transcriptDiv.innerHTML += `
+              <p>
+                <span class="speaker-label" data-speaker-id="${escapedRaw}" title="Click to rename">${display}</span>: ${turn.transcript}
+              </p>`;
+          } else {
+            transcriptDiv.innerHTML += `<p>${turn.transcript}</p>`;
+          }
+        }
+      });
+    }
 
-    // 4) Connect after handlers are ready
-    try {
-      // Log the connection URL with token redacted
-      {
-        const url = transcriber.connectionUrl().toString();
-        const masked = url.replace(/token=[^&]+/, "token=****");
-        console.log("Connecting to:", masked);
+    if (!useDeepgram) {
+      try {
+        {
+          const url = transcriber.connectionUrl().toString();
+          const masked = url.replace(/token=[^&]+/, "token=****");
+          console.log("Connecting to:", masked);
+        }
+        await transcriber.connect();
+        console.log("WebSocket connect() resolved");
+      } catch (e) {
+        console.error("Failed to connect to StreamingTranscriber:", e);
+        recordBtn.innerText = "Record";
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+          mediaStream = null;
+        }
+        if (audioCtx) {
+          try { audioCtx.close(); } catch {}
+          audioCtx = null;
+        }
+        return;
       }
-      await transcriber.connect();
-      console.log("WebSocket connect() resolved");
-    } catch (e) {
-      console.error("Failed to connect to StreamingTranscriber:", e);
-      recordBtn.innerText = "Record";
-      // Stop mic if connect failed
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((t) => t.stop());
-        mediaStream = null;
+    } else {
+      try {
+        const wsUrl = `ws://${location.hostname}:${location.port}/deepgram?sample_rate=${encodeURIComponent(detectedSampleRate)}&encoding=linear16`;
+        dgSocket = new WebSocket(wsUrl);
+        dgSocket.binaryType = "arraybuffer";
+        dgSocket.onopen = () => {
+          recordBtn.innerText = "Stop Recording";
+          isRecording = true;
+          if (statusEl) statusEl.textContent = "Recording";
+        };
+        dgSocket.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data));
+            if (msg && msg.channel && msg.channel.alternatives && msg.channel.alternatives.length) {
+              const alt = msg.channel.alternatives[0];
+              const text = alt.transcript || "";
+              if (text) {
+                try { parseSceneTake(text); } catch {}
+                try { handleStructuralKeywords(text); } catch {}
+              }
+              const isFinal = msg.is_final === true || msg.speech_final === true || msg.type === "final";
+              if (isFinal && text) {
+                let rawSpeaker = null;
+                if (Array.isArray(alt.words) && alt.words.length > 0) {
+                  const last = alt.words[alt.words.length - 1];
+                  if (last && (last.speaker !== undefined && last.speaker !== null)) {
+                    rawSpeaker = String(last.speaker);
+                  }
+                }
+                if (rawSpeaker) {
+                  const display = resolveSpeakerDisplay(rawSpeaker);
+                  const escapedRaw = rawSpeaker.replace(/["\\]/g, "\\$&");
+                  transcriptDiv.innerHTML += `
+                    <p>
+                      <span class="speaker-label" data-speaker-id="${escapedRaw}" title="Click to rename">${display}</span>: ${text}
+                    </p>`;
+                } else {
+                  transcriptDiv.innerHTML += `<p>${text}</p>`;
+                }
+              }
+            }
+          } catch {}
+        };
+        dgSocket.onclose = () => {
+          isRecording = false;
+          recordBtn.innerText = "Record";
+          if (statusEl) statusEl.textContent = "";
+          dgSocket = null;
+        };
+        dgSocket.onerror = () => {};
+      } catch (e) {
+        console.error("Failed to connect to Deepgram:", e);
+        recordBtn.innerText = "Record";
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+          mediaStream = null;
+        }
+        if (audioCtx) {
+          try { audioCtx.close(); } catch {}
+          audioCtx = null;
+        }
+        return;
       }
-      if (audioCtx) {
-        try {
-          audioCtx.close();
-        } catch {}
-        audioCtx = null;
-      }
-      return;
     }
 
     // 5) Stream raw PCM using AudioWorkletNode with fallback to ScriptProcessorNode
@@ -457,7 +563,6 @@ async function run() {
         await audioCtx.audioWorklet.addModule("/audio-processor.js");
         const workletNode = new AudioWorkletNode(audioCtx, "audio-processor");
         workletNode.port.onmessage = (event) => {
-          if (!transcriber) return;
           const float32 = event.data; // Float32Array [-1,1] ~128 samples/frame
           if (!float32 || !float32.length) return;
           chunkBuffer.push(float32);
@@ -482,12 +587,17 @@ async function run() {
             }
             chunkLength -= take;
 
+            const pcm16 = floatTo16BitPCM(merged);
             try {
-              const pcm16 = floatTo16BitPCM(merged);
-              transcriber.sendAudio(pcm16.buffer);
+              if (useDeepgram) {
+                if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+                  dgSocket.send(pcm16.buffer);
+                }
+              } else {
+                if (transcriber) transcriber.sendAudio(pcm16.buffer);
+              }
             } catch (sendErr) {
-              // If the socket closed, avoid further sends
-              console.warn("sendAudio failed:", sendErr);
+              console.warn("audio send failed:", sendErr);
             }
           }
         };
@@ -502,10 +612,19 @@ async function run() {
         const channels = 1;
         const scriptNode = audioCtx.createScriptProcessor(bufferSize, channels, channels);
         scriptNode.onaudioprocess = (e) => {
-          if (!transcriber) return;
           const inputBuffer = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
           const pcm16 = floatTo16BitPCM(inputBuffer);
-          transcriber.sendAudio(pcm16.buffer);
+          try {
+            if (useDeepgram) {
+              if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+                dgSocket.send(pcm16.buffer);
+              }
+            } else {
+              if (transcriber) transcriber.sendAudio(pcm16.buffer);
+            }
+          } catch (sendErr) {
+            console.warn("audio send failed:", sendErr);
+          }
         };
         sourceNode.connect(scriptNode);
         // Some browsers require connection to destination
@@ -536,6 +655,9 @@ async function run() {
       try {
         if (transcriber) transcriber.close();
       } catch {}
+      try {
+        if (dgSocket && dgSocket.readyState === WebSocket.OPEN) dgSocket.close();
+      } catch {}
       recordBtn.innerText = "Record";
       isRecording = false;
       return;
@@ -564,3 +686,18 @@ if (sourceTypeSel) {
 
 // Populate audio device list (best-effort)
 listAudioInputs();
+
+// FR-4: Click-to-rename speaker labels via event delegation
+if (transcriptDiv) {
+  transcriptDiv.addEventListener("click", (e) => {
+    const el = e.target;
+    if (el && el.classList && el.classList.contains("speaker-label")) {
+      const raw = el.getAttribute("data-speaker-id");
+      const current = (raw && speakerMap.get(raw)) || el.textContent || "";
+      const newName = window.prompt("Rename speaker:", current);
+      if (newName && newName.trim()) {
+        renameSpeaker(raw, newName.trim());
+      }
+    }
+  });
+}
